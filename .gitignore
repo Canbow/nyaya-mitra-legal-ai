@@ -1,0 +1,10 @@
+# Node.js Backend
+backend/node_modules/
+backend/.env
+
+# Flutter Frontend
+frontend/.dart_tool/
+frontend/.flutter-plugins
+frontend/.flutter-plugins-dependencies
+frontend/build/
+frontend/windows/flutter/ephemeral/
