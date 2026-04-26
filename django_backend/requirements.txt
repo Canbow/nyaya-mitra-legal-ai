@@ -1,0 +1,8 @@
+Django>=4.2,<5.0
+djangorestframework
+psycopg2-binary
+python-dotenv
+google-generativeai
+dj-database-url
+django-cors-headers
+pgvector

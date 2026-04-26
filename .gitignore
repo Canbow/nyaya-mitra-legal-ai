@@ -8,3 +8,12 @@ frontend/.flutter-plugins
 frontend/.flutter-plugins-dependencies
 frontend/build/
 frontend/windows/flutter/ephemeral/
+
+node_modules/
+.env
+artifacts/
+cache/
+coverage/
+typechain-types/
+frontend/out/
+frontend/build/

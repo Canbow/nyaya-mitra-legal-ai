@@ -78,3 +78,16 @@ python manage.py migrate
 
 # Start the server
 python manage.py runserver
+
+### 2. Frontend Setup (Flutter)
+# Open a new terminal and navigate to the frontend folder
+cd Nyaya-Mitra/frontend
+
+# Fetch Flutter packages
+flutter pub get
+
+# Run the app
+flutter run
+
+🔒 Security Note
+This application utilizes sensitive API keys and database credentials. Never commit the .env file to version control. Ensure .env is listed in your .gitignore before pushing any code
