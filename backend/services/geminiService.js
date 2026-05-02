@@ -6,38 +6,85 @@
  *
  * Models Used:
  *   - gemini-embedding-001  (3072 dimensions)
- *   - gemini-2.0-flash      (text generation)
+ *   - gemini-2.0-flash-lite (text generation)
  */
 
 const { GoogleGenerativeAI } = require('@google/generative-ai');
+const Groq = require('groq-sdk');
 
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
 
 const EMBEDDING_MODEL = 'gemini-embedding-001';
-const GENERATION_MODEL = 'gemini-2.0-flash';
+const GROQ_MODEL = 'llama-3.3-70b-versatile';
 
 // ---------------------------------------------------------------------------
-// Gemini Client
+// Gemini Client (for embeddings only)
 // ---------------------------------------------------------------------------
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+
+// ---------------------------------------------------------------------------
+// Groq Client (for text generation)
+// ---------------------------------------------------------------------------
+
+const groq = new Groq({
+  apiKey: process.env.GROQ_API_KEY,
+});
+
+const GROQ_FALLBACK_MODEL = 'llama-3.1-8b-instant'; // Smaller model with higher rate limits
+
+// ---------------------------------------------------------------------------
+// Utility: Handle rate limits with retry and fallback
+// ---------------------------------------------------------------------------
+
+const callGroqWithFallback = async (messages, temperature, maxTokens, isRateLimit = false) => {
+  const model = isRateLimit ? GROQ_FALLBACK_MODEL : GROQ_MODEL;
+  
+  try {
+    const response = await groq.chat.completions.create({
+      model,
+      messages,
+      temperature,
+      max_tokens: maxTokens,
+    });
+    return response;
+  } catch (err) {
+    // If rate limited and not already using fallback, retry with fallback model
+    if (err.status === 429 && !isRateLimit) {
+      console.warn(`[Groq] Rate limit on ${GROQ_MODEL}, retrying with ${GROQ_FALLBACK_MODEL}`);
+      // Wait briefly before retry
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      return callGroqWithFallback(messages, temperature, maxTokens, true);
+    }
+    throw err;
+  }
+};
 
 // ---------------------------------------------------------------------------
 // Utility: Safely parse JSON from LLM response
 // ---------------------------------------------------------------------------
 
 const parseJsonResponse = (text) => {
+  if (!text || typeof text !== 'string') {
+    throw new Error(`Expected string response, got ${typeof text}`);
+  }
+
   // Strip markdown code fences if present
   let cleaned = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
   
   try {
-    return JSON.parse(cleaned);
+    const parsed = JSON.parse(cleaned);
+    return parsed;
   } catch (err) {
     console.error('[geminiService] JSON parse failed:', err.message);
-    console.error('[geminiService] Raw response:', text.substring(0, 200));
-    throw new Error(`Failed to parse LLM JSON response: ${err.message}`);
+    console.error('[geminiService] Cleaned text:', cleaned.substring(0, 500));
+    console.error('[geminiService] Original text:', text.substring(0, 500));
+    throw new Error(
+      `Failed to parse LLM JSON response. Expected valid JSON object. ` +
+      `Got: "${cleaned.substring(0, 100)}..."`
+    );
   }
 };
 
@@ -99,30 +146,50 @@ const embedText = async (text) => {
  */
 const extractClauses = async (rawText) => {
   try {
-    const model = genAI.getGenerativeModel({ model: GENERATION_MODEL });
-    
-    const prompt = `You are a legal document parser.
-Extract every distinct clause, section, or meaningful statement from the following legal document text.
-Return ONLY a valid JSON array with no explanation, no markdown, no preamble.
+    const response = await callGroqWithFallback(
+      [
+        {
+          role: 'system',
+          content: 'You are a legal document parser. Always respond with valid JSON only. No explanation, no markdown, no preamble.'
+        },
+        {
+          role: 'user',
+          content: `Extract every distinct clause, section, or meaningful 
+statement from the following legal document text.
+
+Return ONLY a valid JSON array.
 Each element must have exactly two fields:
-  clause_number: sequential integer starting from 1
-  clause_text: the exact text of that clause
+  "clause_number": sequential integer starting from 1
+  "clause_text": the exact text of that clause
+
 If numbered clauses exist preserve that structure.
 If continuous prose split by logical legal statements.
 
 Document text:
-${rawText}`;
+${rawText}`
+        }
+      ],
+      0.1,
+      4000
+    );
 
-    const response = await model.generateContent(prompt);
-    const responseText = response.response.text();
+    const raw = response.choices[0].message.content;
     
-    const clauses = parseJsonResponse(responseText);
+    // Safely parse JSON — strip markdown fences if present
+    const cleaned = raw.replace(/```json|```/g, '').trim();
     
-    if (!Array.isArray(clauses)) {
-      throw new Error('Expected array of clauses');
+    try {
+      const parsed = JSON.parse(cleaned);
+      
+      if (!Array.isArray(parsed)) {
+        throw new Error('Expected array of clauses');
+      }
+      
+      return parsed;
+    } catch (err) {
+      console.error('[extractClauses] Raw response:', raw.substring(0, 200));
+      throw new Error('[extractClauses] Clause extraction failed: invalid JSON from Groq');
     }
-    
-    return clauses;
   } catch (err) {
     throw new Error(`[extractClauses] Clause extraction failed: ${err.message}`);
   }
@@ -149,40 +216,75 @@ ${rawText}`;
  */
 const analyzeClause = async (clauseText, retrievedLaws) => {
   try {
-    const model = genAI.getGenerativeModel({ model: GENERATION_MODEL });
-    
     const lawsContext = retrievedLaws && retrievedLaws.length > 0
-      ? retrievedLaws.join('\n\n---\n\n')
-      : '(No relevant laws retrieved)';
-    
-    const prompt = `You are an expert Indian legal assistant.
-Analyze the following clause from a legal document.
+      ? retrievedLaws.join('\n\n')
+      : 'No specific laws retrieved. Use your general knowledge of Indian law.';
+
+    const response = await callGroqWithFallback(
+      [
+        {
+          role: 'system',
+          content: 'You are an expert Indian legal assistant. Always respond with valid JSON only. No explanation, no markdown, no preamble.'
+        },
+        {
+          role: 'user',
+          content: `Analyze the following clause from a legal document.
 
 Clause: ${clauseText}
 
-Relevant laws:
+Relevant laws from knowledge base:
 ${lawsContext}
 
-Respond ONLY with a valid JSON object with these fields:
-  is_risky: true or false
-  risk_level: low, medium, high, or critical (null if not risky)
-  issue: one sentence describing the problem (null if not risky)
-  relevant_law: specific article or section that applies (null if not risky)
-  recommendation: what the user should do (null if not risky)`;
+Respond ONLY with a valid JSON object with exactly these fields:
+{
+  "is_risky": true or false,
+  "risk_level": "low" or "medium" or "high" or "critical" or null,
+  "issue": "one sentence describing the problem" or null,
+  "relevant_law": "specific article or section that applies" or null,
+  "recommendation": "what the user should do about this" or null
+}`
+        }
+      ],
+      0.1,
+      500
+    );
 
-    const response = await model.generateContent(prompt);
-    const responseText = response.response.text();
-    
-    const analysis = parseJsonResponse(responseText);
-    
-    // Validate response structure
-    if (typeof analysis.is_risky !== 'boolean') {
-      throw new Error('is_risky must be boolean');
+    const raw = response.choices[0].message.content;
+    const cleaned = raw.replace(/```json|```/g, '').trim();
+
+    try {
+      const analysis = JSON.parse(cleaned);
+      
+      // Ensure null fields are properly set for non-risky clauses
+      if (!analysis.is_risky) {
+        analysis.risk_level = null;
+        analysis.issue = null;
+        analysis.relevant_law = null;
+        analysis.recommendation = null;
+      }
+      
+      return analysis;
+    } catch (err) {
+      console.error('[analyzeClause] Raw response:', raw.substring(0, 200));
+      // Return safe default instead of crashing entire pipeline
+      return {
+        is_risky: false,
+        risk_level: null,
+        issue: null,
+        relevant_law: null,
+        recommendation: null
+      };
     }
-    
-    return analysis;
   } catch (err) {
-    throw new Error(`[analyzeClause] Clause analysis failed: ${err.message}`);
+    // Return safe default instead of crashing entire pipeline
+    console.error('[analyzeClause] Error:', err.message);
+    return {
+      is_risky: false,
+      risk_level: null,
+      issue: null,
+      relevant_law: null,
+      recommendation: null
+    };
   }
 };
 
@@ -202,28 +304,104 @@ Respond ONLY with a valid JSON object with these fields:
  * const summary = await generateSummary(riskyAnalyses, 'Employment Contract');
  * // Returns: "This employment contract contains 2 high-risk clauses..."
  */
-const generateSummary = async (riskyClauseAnalyses, documentName) => {
+const generateSummary = async (allClauseAnalyses, documentName) => {
   try {
-    const model = genAI.getGenerativeModel({ model: GENERATION_MODEL });
-    
-    const clausesSummary = riskyClauseAnalyses
-      .map(c => `- Clause ${c.clause_number}: ${c.issue} (Risk: ${c.risk_level})`)
+    const riskyCount = allClauseAnalyses.filter(c => c.is_risky).length;
+    const totalCount = allClauseAnalyses.length;
+
+    const riskyDetails = allClauseAnalyses
+      .filter(c => c.is_risky)
+      .map(c => `Clause ${c.clause_number}: ${c.issue}`)
       .join('\n');
-    
-    const prompt = `You are an expert Indian legal advisor.
-Generate a concise executive summary (2-3 sentences) for a legal document with the following risky clauses:
 
-Document: ${documentName}
+    const response = await callGroqWithFallback(
+      [
+        {
+          role: 'system',
+          content: 'You are an expert Indian legal assistant who explains legal documents in simple language.'
+        },
+        {
+          role: 'user',
+          content: `Generate a plain language summary of this legal document analysis.
 
-Risky clauses found:
-${clausesSummary}
+Document name: ${documentName}
+Total clauses analyzed: ${totalCount}
+Risky clauses found: ${riskyCount}
 
-Provide only the summary text, no preamble.`;
+Risky clause details:
+${riskyDetails || 'No risky clauses found.'}
 
-    const response = await model.generateContent(prompt);
-    return response.response.text();
+Write a 3-4 sentence summary in simple English that a non-lawyer 
+can understand. Mention the overall risk level and the most 
+important issues found.`
+        }
+      ],
+      0.3,
+      300
+    );
+
+    return response.choices[0].message.content.trim();
   } catch (err) {
+    console.error('[generateSummary] Error:', err.message);
     throw new Error(`[generateSummary] Summary generation failed: ${err.message}`);
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Generate chat response for conversational Q&A
+// ---------------------------------------------------------------------------
+
+/**
+ * Generates a response to a user question using retrieved legal context.
+ *
+ * @param {string} userMessage - The user's question
+ * @param {string[]} retrievedLaws - Array of relevant law texts
+ * @param {Array} chatHistory - Recent chat history for context
+ * @returns {Promise<string>} The AI response
+ * @throws {Error} On API error
+ */
+const generateChatResponse = async (userMessage, retrievedLaws, chatHistory = []) => {
+  try {
+    const lawsContext = retrievedLaws && retrievedLaws.length > 0
+      ? retrievedLaws.join('\n\n---\n\n')
+      : 'No specific laws retrieved. Use your general knowledge of Indian law.';
+
+    // Build conversation history for Groq
+    const messages = [
+      {
+        role: 'system',
+        content: `You are Nyaya-Mitra, an expert Indian legal assistant.
+Answer questions based on the provided legal context.
+If the context does not cover the question, use your general 
+knowledge of Indian law but clearly state that.
+Always respond in simple, clear English that a non-lawyer 
+can understand.
+Relevant laws from knowledge base:
+${lawsContext}`
+      }
+    ];
+
+    // Add last few chat history messages for context
+    if (chatHistory && chatHistory.length > 0) {
+      const recentHistory = chatHistory.slice(-3); // Last 3 messages
+      recentHistory.forEach(h => {
+        messages.push({ role: 'user', content: h.query_text });
+        messages.push({ role: 'assistant', content: h.ai_response });
+      });
+    }
+
+    // Add current user message
+    messages.push({
+      role: 'user',
+      content: userMessage
+    });
+
+    const response = await callGroqWithFallback(messages, 0.3, 1000);
+
+    return response.choices[0].message.content.trim();
+  } catch (err) {
+    console.error('[generateChatResponse] Error:', err.message);
+    throw new Error(`[generateChatResponse] Chat response generation failed: ${err.message}`);
   }
 };
 
@@ -236,4 +414,5 @@ module.exports = {
   extractClauses,
   analyzeClause,
   generateSummary,
+  generateChatResponse,
 };

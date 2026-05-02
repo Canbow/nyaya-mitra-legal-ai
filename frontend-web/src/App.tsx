@@ -9,6 +9,18 @@ export default function App() {
   const [isLoading, setIsLoading] = useState(false);
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [showAuthModal, setShowAuthModal] = useState(false);
+  const [userId, setUserId] = useState<string | null>(
+    localStorage.getItem('nyaya_user_id')
+  );
+  const [userName, setUserName] = useState<string>(
+    localStorage.getItem('nyaya_user_name') || ''
+  );
+  const [authEmail, setAuthEmail] = useState('');
+  const [authName, setAuthName] = useState('');
+  const [authMode, setAuthMode] = useState<'login' | 'register'>('login');
+  const [authError, setAuthError] = useState('');
+
+  
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const quickPrompts = [

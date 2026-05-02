@@ -78,42 +78,15 @@ router.post('/', async (req, res) => {
     const searchResults = await semanticSearch(embedding, 5);
     const retrievedLaws = searchResults.map(r => r.content_text);
 
-    // ===== STEP 3: Build prompt with context =====
-    const lawsContext = retrievedLaws.length > 0
-      ? retrievedLaws.join('\n\n---\n\n')
-      : '(No relevant laws found in knowledge base)';
+    // ===== STEP 3: Get recent chat history for context =====
+    const chatHistory = await getChatHistory(user_id, 3); // Last 3 messages
 
-    const systemPrompt = `You are Nyaya-Mitra, an expert Indian legal assistant. 
-You help users understand Indian laws and their rights.
-Respond based on the retrieved legal knowledge below, cite specific sections and articles.
-Be concise but comprehensive.
-If you don't know, say so clearly.`;
-
-    const userPrompt = `Using the following Indian laws as reference:
-
-RETRIEVED LEGAL KNOWLEDGE:
-${lawsContext}
-
-USER QUESTION:
-${message}
-
-Provide a response citing relevant articles and sections.`;
-
-    // ===== STEP 4: Get Gemini response =====
-    const genAI = require('@google/generative-ai').GoogleGenerativeAI;
-    const client = new genAI(process.env.GEMINI_API_KEY);
-    const model = client.getGenerativeModel({ model: 'gemini-2.0-flash' });
-
-    const response = await model.generateContent({
-      contents: [
-        {
-          role: 'user',
-          parts: [{ text: systemPrompt + '\n\n' + userPrompt }],
-        },
-      ],
-    });
-
-    const aiResponse = response.response.text();
+    // ===== STEP 4: Generate response using Groq =====
+    const aiResponse = await geminiService.generateChatResponse(
+      message,
+      retrievedLaws,
+      chatHistory
+    );
 
     // ===== STEP 5: Save to chat history =====
     const savedMessage = await saveChatMessage(user_id, message, aiResponse);
