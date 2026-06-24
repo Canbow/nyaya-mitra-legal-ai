@@ -308,4 +308,4 @@ Please analyze this contract and return a JSON object with:
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`Nyaya-Mitra Backend running on http://localhost:${PORT}`);
-});
+});
