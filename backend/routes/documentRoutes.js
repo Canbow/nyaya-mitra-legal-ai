@@ -15,6 +15,8 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const { analyzeDocument } = require('../services/documentService');
+const { cache } = require('../services/documentCacheService');
+const { pool } = require('../db/connection');
 
 // ---------------------------------------------------------------------------
 // Multer Configuration
@@ -152,6 +154,143 @@ router.post('/upload', upload.single('file'), async (req, res) => {
     }
 
     return res.status(500).json({ error: `Processing error: ${err.message}` });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/documents/cache/stats
+// ---------------------------------------------------------------------------
+
+/**
+ * Get document cache statistics.
+ *
+ * Response (200 - OK):
+ *   {
+ *     size: 42,
+ *     maxSize: 1000,
+ *     ttlSeconds: 3600
+ *   }
+ */
+router.get('/cache/stats', (req, res) => {
+  const stats = cache.getStats();
+  return res.status(200).json(stats);
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/documents/cache/clear
+// ---------------------------------------------------------------------------
+
+/**
+ * Clear the entire document cache.
+ *
+ * Response (200 - OK):
+ *   { message: "Cache cleared" }
+ */
+router.post('/cache/clear', (req, res) => {
+  cache.clear();
+  return res.status(200).json({ message: 'Document cache cleared' });
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/documents/:docId
+// ---------------------------------------------------------------------------
+
+/**
+ * Retrieve a previously analyzed document with all its clause details.
+ *
+ * Response (200 - OK):
+ *   {
+ *     doc_id: "uuid",
+ *     document_name: "filename.pdf",
+ *     overall_risk_level: "high",
+ *     total_clauses: 42,
+ *     risky_clauses: 5,
+ *     summary: "This document contains...",
+ *     uploaded_at: "ISO timestamp",
+ *     clauses: [
+ *       {
+ *         clause_id: "uuid",
+ *         clause_number: 1,
+ *         clause_text: "...",
+ *         is_risky: true,
+ *         risk_level: "high",
+ *         issue: "...",
+ *         relevant_law: "...",
+ *         recommendation: "..."
+ *       },
+ *       ...
+ *     ]
+ *   }
+ *
+ * Response (404 - Not Found):
+ *   { error: "Document not found" }
+ */
+router.get('/:docId', async (req, res) => {
+  try {
+    const { docId } = req.params;
+
+    // Check cache first
+    const cached = cache.get(docId);
+    if (cached) {
+      console.log(`[documentRoutes] Cache hit for document ${docId}`);
+      return res.status(200).json(cached);
+    }
+
+    // Fetch from database
+    const docResult = await pool.query(
+      `SELECT doc_id, user_id, document_name, risk_level, generated_summary, uploaded_at
+       FROM user_documents
+       WHERE doc_id = $1`,
+      [docId]
+    );
+
+    if (docResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Document not found' });
+    }
+
+    const document = docResult.rows[0];
+
+    // Fetch all clauses for this document
+    const clausesResult = await pool.query(
+      `SELECT clause_id, clause_number, clause_text, is_risky, risk_level, issue, relevant_law, recommendation
+       FROM document_clauses
+       WHERE doc_id = $1
+       ORDER BY clause_number ASC`,
+      [docId]
+    );
+
+    const clauses = clausesResult.rows;
+
+    // Count risky clauses
+    const riskyClauseCount = clauses.filter(c => c.is_risky).length;
+
+    const response = {
+      doc_id: document.doc_id,
+      document_name: document.document_name,
+      overall_risk_level: document.risk_level,
+      total_clauses: clauses.length,
+      risky_clauses: riskyClauseCount,
+      summary: document.generated_summary,
+      uploaded_at: document.uploaded_at,
+      clauses: clauses.map(c => ({
+        clause_id: c.clause_id,
+        clause_number: c.clause_number,
+        clause_text: c.clause_text,
+        is_risky: c.is_risky,
+        risk_level: c.risk_level,
+        issue: c.issue,
+        relevant_law: c.relevant_law,
+        recommendation: c.recommendation,
+      })),
+    };
+
+    // Cache the result
+    cache.set(docId, response);
+
+    return res.status(200).json(response);
+  } catch (err) {
+    console.error('[documentRoutes] Error fetching document:', err.message);
+    return res.status(500).json({ error: `Failed to retrieve document: ${err.message}` });
   }
 });
 

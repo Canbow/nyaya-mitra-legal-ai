@@ -6,18 +6,24 @@ const { semanticSearch } = require('./db/models/vectorModel');
 
 const app = express();
 app.use(cors());
-app.use(express.json()); // Allows the server to read JSON from Flutter
+app.use(express.json());
+
+const authRoutes = require('./routes/authRoutes');
+app.use('/api/auth', authRoutes);
+
+// Import route modules
+const documentRoutes = require('./routes/documentRoutes');
+const chatRoutes = require('./routes/chatRoutes');
 
 // Initialize Gemini
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 // --- HEALTH CHECK ENDPOINT ---
-// This handles the browser visiting http://localhost:3000/
 app.get('/', (req, res) => {
     res.send("<h2>🟢 Nyaya-Mitra Legal Server is Live and Running!</h2>");
 });
 
-// --- THE CHAT API ENDPOINT WITH RAG PIPELINE ---
+// --- THE CHAT API ENDPOINT WITH RAG PIPELINE (Inline / Flutter fallback) ---
 /**
  * RAG Pipeline Flow:
  *   1. User sends question
@@ -27,51 +33,53 @@ app.get('/', (req, res) => {
  *   5. Send augmented prompt to Gemini LLM
  *   6. Return grounded response to user
  */
-app.post('/api/chat', async (req, res) => {
-    try {
-        const userQuestion = req.body.question;
-        console.log(`Flutter asked: "${userQuestion}"`);
+app.post('/api/chat', async (req, res, next) => {
+    // If request contains 'question' (as expected by Flutter/inline schema), handle here
+    if (req.body && req.body.question) {
+        try {
+            const userQuestion = req.body.question;
+            console.log(`Flutter asked: "${userQuestion}"`);
 
-        // ===== STEP 1: Embed the user's question =====
-        const model = genAI.getGenerativeModel({ model: "gemini-embedding-001" });
-        console.log("[RAG] Generating embedding for question...");
-        
-        const embeddingResult = await model.embedContent(userQuestion);
-        const queryVector = embeddingResult.embedding.values;
-        
-        if (!queryVector || queryVector.length !== 3072) {
-            throw new Error(`Invalid embedding dimensions: ${queryVector?.length}`);
-        }
-        console.log(`[RAG] Embedding complete (3072 dimensions)`);
+            // ===== STEP 1: Embed the user's question =====
+            const model = genAI.getGenerativeModel({ model: "gemini-embedding-001" });
+            console.log("[RAG] Generating embedding for question...");
+            
+            const embeddingResult = await model.embedContent(userQuestion);
+            const queryVector = embeddingResult.embedding.values;
+            
+            if (!queryVector || queryVector.length !== 3072) {
+                throw new Error(`Invalid embedding dimensions: ${queryVector?.length}`);
+            }
+            console.log(`[RAG] Embedding complete (3072 dimensions)`);
 
-        // ===== STEP 2: Search database for relevant legal context =====
-        console.log("[RAG] Searching legal knowledge base...");
-        const searchResults = await semanticSearch(queryVector, 5);
-        console.log(`[RAG] Found ${searchResults.length} relevant legal chunks`);
+            // ===== STEP 2: Search database for relevant legal context =====
+            console.log("[RAG] Searching legal knowledge base...");
+            const searchResults = await semanticSearch(queryVector, 5);
+            console.log(`[RAG] Found ${searchResults.length} relevant legal chunks`);
 
-        // ===== STEP 3: Build the augmented prompt with retrieved context =====
-        let lawsContext = '';
-        let retrievedLaws = [];
-        
-        if (searchResults.length > 0) {
-            retrievedLaws = searchResults.map((r, idx) => ({
-                rank: idx + 1,
-                source: r.dataset_source,
-                score: r.similarity_score,
-                content: r.content_text
-            }));
+            // ===== STEP 3: Build the augmented prompt with retrieved context =====
+            let lawsContext = '';
+            let retrievedLaws = [];
+            
+            if (searchResults.length > 0) {
+                retrievedLaws = searchResults.map((r, idx) => ({
+                    rank: idx + 1,
+                    source: r.dataset_source,
+                    score: r.similarity_score,
+                    content: r.content_text
+                }));
 
-            lawsContext = searchResults
-                .map((r, idx) => `[${idx + 1}] (Source: ${r.dataset_source}, Score: ${r.similarity_score.toFixed(4)})\n${r.content_text}`)
-                .join('\n\n---\n\n');
-        } else {
-            lawsContext = '(No relevant laws found in the knowledge base)';
-        }
+                lawsContext = searchResults
+                    .map((r, idx) => `[${idx + 1}] (Source: ${r.dataset_source}, Score: ${r.similarity_score.toFixed(4)})\n${r.content_text}`)
+                    .join('\n\n---\n\n');
+            } else {
+                lawsContext = '(No relevant laws found in the knowledge base)';
+            }
 
-        console.log("[RAG] Building augmented prompt with legal context...");
+            console.log("[RAG] Building augmented prompt with legal context...");
 
-        // ===== STEP 4: Create the augmented prompt =====
-        const systemPrompt = `You are Nyaya-Mitra, an expert Indian Legal Assistant powered by RAG (Retrieval-Augmented Generation). 
+            // ===== STEP 4: Create the augmented prompt =====
+            const systemPrompt = `You are Nyaya-Mitra, an expert Indian Legal Assistant powered by RAG (Retrieval-Augmented Generation). 
 Your task is to answer legal questions based STRICTLY on the retrieved Indian legal knowledge provided below.
 Rules:
 - Always cite specific sections, articles, and sources
@@ -81,7 +89,7 @@ Rules:
 - Be conservative: when in doubt, recommend consulting a qualified lawyer
 - Format your response with clear sections and bullet points for readability`;
 
-        const userPrompt = `RETRIEVED LEGAL CONTEXT (from Indian Laws Database):
+            const userPrompt = `RETRIEVED LEGAL CONTEXT (from Indian Laws Database):
 ${lawsContext}
 
 USER QUESTION:
@@ -93,40 +101,48 @@ INSTRUCTIONS:
 3. If the context is insufficient, explain what additional information would help
 4. Conclude with practical guidance or next steps if applicable`;
 
-        // ===== STEP 5: Get the answer from Gemini with augmented context =====
-        console.log("[RAG] Calling Gemini LLM with augmented prompt...");
-        const generationModel = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
-        
-        const result = await generationModel.generateContent({
-            contents: [
-                {
-                    role: 'user',
-                    parts: [{ text: userPrompt }]
-                }
-            ],
-            systemInstruction: systemPrompt
-        });
+            // ===== STEP 5: Get the answer from Gemini with augmented context =====
+            console.log("[RAG] Calling Gemini LLM with augmented prompt...");
+            const generationModel = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+            
+            const result = await generationModel.generateContent({
+                contents: [
+                    {
+                        role: 'user',
+                        parts: [{ text: userPrompt }]
+                    }
+                ],
+                systemInstruction: systemPrompt
+            });
 
-        const aiAnswer = result.response.text();
-        console.log("[RAG] Answer generated successfully!");
+            const aiAnswer = result.response.text();
+            console.log("[RAG] Answer generated successfully!");
 
-        // ===== STEP 6: Send response back to Flutter =====
-        res.json({ 
-            answer: aiAnswer,
-            retrievedLaws: retrievedLaws,
-            contextUsed: searchResults.length > 0
-        });
-        console.log("Response sent back to Flutter with RAG context!");
+            // ===== STEP 6: Send response back to Flutter =====
+            res.json({ 
+                answer: aiAnswer,
+                retrievedLaws: retrievedLaws,
+                contextUsed: searchResults.length > 0
+            });
+            console.log("Response sent back to Flutter with RAG context!");
 
-    } catch (error) {
-        console.error("[RAG] API Error:", error.message);
-        console.error(error.stack);
-        res.status(500).json({ 
-            error: "Something went wrong on the server.",
-            details: error.message 
-        });
+        } catch (error) {
+            console.error("[RAG] API Error:", error.message);
+            console.error(error.stack);
+            res.status(500).json({ 
+                error: "Something went wrong on the server.",
+                details: error.message 
+            });
+        }
+    } else {
+        // Fallback to standard chatRoutes (which expects user_id and message)
+        next();
     }
 });
+
+// --- REGISTER ROUTES ---
+app.use('/api/documents', documentRoutes);
+app.use('/api/chat', chatRoutes);
 
 // --- DOCUMENT UPLOAD ENDPOINT WITH RAG ANALYSIS ---
 /**

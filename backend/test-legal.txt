@@ -1,0 +1,4 @@
+﻿This is a legal test document.
+Clause 1: Payment must be made within 30 days.
+Clause 2: Either party may terminate with notice.
+Clause 3: Disputes resolved through arbitration.
